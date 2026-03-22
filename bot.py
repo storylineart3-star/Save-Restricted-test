@@ -1,8 +1,9 @@
-import asyncio
-import re
-import sqlite3
-import logging
 import os
+import re
+import time
+import asyncio
+import logging
+from datetime import datetime
 
 from telegram import Update
 from telegram.ext import (
@@ -11,172 +12,208 @@ from telegram.ext import (
 )
 
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError, SessionPasswordNeededError
 
-# ---------- ENV VARIABLES ----------
+from motor.motor_asyncio import AsyncIOMotorClient
+
+# ===== CONFIG =====
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-# ----------------------------------
+MONGO_URI = os.getenv("MONGO_URI")
+
+ADMIN_IDS = [123456789]
+
+COOLDOWN = 15
+AUTO_DELETE = 300
+MAX_FILE_MB = 100
 
 logging.basicConfig(level=logging.INFO)
 
-DB_PATH = "sessions.db"
+# ===== MONGO =====
+mongo = AsyncIOMotorClient(MONGO_URI)
+db = mongo["telegram_bot"]
+users_col = db["users"]
+sessions_col = db["sessions"]
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS sessions
-                 (user_id INTEGER PRIMARY KEY, session_string TEXT)''')
-    conn.commit()
-    conn.close()
-
-def get_session_string(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT session_string FROM sessions WHERE user_id=?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-def save_session_string(user_id, session_string):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("REPLACE INTO sessions (user_id, session_string) VALUES (?, ?)",
-              (user_id, session_string))
-    conn.commit()
-    conn.close()
-
+# ===== MEMORY =====
 clients = {}
+last_used = {}
+queue = asyncio.Queue()
 
-def get_client(user_id):
+# ===== GET CLIENT =====
+async def get_client(user_id):
     if user_id in clients:
         return clients[user_id]
-    session_str = get_session_string(user_id)
-    if session_str:
-        client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-        clients[user_id] = client
-        return client
-    return None
 
+    data = await sessions_col.find_one({"user_id": user_id})
+    if not data:
+        return None
+
+    client = TelegramClient(StringSession(data["session"]), API_ID, API_HASH)
+    await client.connect()
+
+    clients[user_id] = client
+    return client
+
+# ===== LOGIN =====
 PHONE, CODE, PASSWORD = range(3)
 
-async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send phone number with country code:")
+async def login_start(update, context):
+    await update.message.reply_text("📱 Send phone number")
     return PHONE
 
-async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def login_phone(update, context):
     phone = update.message.text
-    context.user_data['phone'] = phone
+    context.user_data["phone"] = phone
 
     client = TelegramClient(StringSession(), API_ID, API_HASH)
-    context.user_data['temp_client'] = client
-
     await client.connect()
     await client.send_code_request(phone)
 
-    await update.message.reply_text("Enter OTP (with spaces like 1 2 3 4 5):")
+    context.user_data["client"] = client
+    await update.message.reply_text("Enter OTP")
     return CODE
 
-async def login_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def login_code(update, context):
     code = update.message.text.replace(" ", "")
-    client = context.user_data['temp_client']
-    phone = context.user_data['phone']
+    client = context.user_data["client"]
+    phone = context.user_data["phone"]
     user_id = update.effective_user.id
 
     try:
         await client.sign_in(phone, code)
-        session_str = client.session.save()
-        save_session_string(user_id, session_str)
-        clients[user_id] = client
-
-        await update.message.reply_text("✅ Login successful!")
-        return ConversationHandler.END
-
     except SessionPasswordNeededError:
-        await update.message.reply_text("Enter 2FA password:")
+        await update.message.reply_text("Enter 2FA password")
         return PASSWORD
 
-async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    password = update.message.text
-    client = context.user_data['temp_client']
-    user_id = update.effective_user.id
+    session = client.session.save()
+    await sessions_col.update_one(
+        {"user_id": user_id},
+        {"$set": {"session": session}},
+        upsert=True
+    )
 
-    await client.sign_in(password=password)
-    session_str = client.session.save()
-    save_session_string(user_id, session_str)
     clients[user_id] = client
+    await users_col.update_one({"user_id": user_id}, {"$set": {}}, upsert=True)
 
     await update.message.reply_text("✅ Login successful!")
     return ConversationHandler.END
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Cancelled")
+async def login_password(update, context):
+    client = context.user_data["client"]
+    user_id = update.effective_user.id
+
+    await client.sign_in(password=update.message.text)
+
+    session = client.session.save()
+    await sessions_col.update_one(
+        {"user_id": user_id},
+        {"$set": {"session": session}},
+        upsert=True
+    )
+
+    clients[user_id] = client
+    await update.message.reply_text("✅ Login successful!")
     return ConversationHandler.END
 
-async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in clients:
-        await clients[user_id].disconnect()
-        del clients[user_id]
-    save_session_string(user_id, None)
-    await update.message.reply_text("Logged out")
+# ===== QUEUE WORKER =====
+async def worker():
+    while True:
+        update, context, text = await queue.get()
+        user_id = update.effective_user.id
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        msg = await update.message.reply_text("⏳ Processing...")
+
+        try:
+            client = await get_client(user_id)
+
+            match = re.search(r'https?://t\.me/(?:c/)?([^/]+)/(\d+)', text)
+            chat = match.group(1)
+            msg_id = int(match.group(2))
+
+            entity = await client.get_entity(int(f"-100{chat}") if chat.isdigit() else chat)
+            message = await client.get_messages(entity, ids=msg_id)
+
+            if message.file and message.file.size > MAX_FILE_MB * 1024 * 1024:
+                await msg.edit_text("❌ File too large")
+                continue
+
+            progress_msg = await update.message.reply_text("📥 Downloading... 0%")
+
+            def progress(current, total):
+                percent = int(current * 100 / total)
+                asyncio.create_task(progress_msg.edit_text(f"📥 Downloading... {percent}%"))
+
+            file = await client.download_media(message, progress_callback=progress)
+
+            sent = await update.message.reply_document(open(file, "rb"))
+
+            asyncio.create_task(auto_delete(context, sent.chat_id, sent.message_id, file))
+
+            await msg.edit_text("✅ Done")
+
+        except Exception as e:
+            await msg.edit_text(f"Error: {str(e)}")
+
+        queue.task_done()
+
+# ===== AUTO DELETE =====
+async def auto_delete(context, chat_id, msg_id, file):
+    await asyncio.sleep(AUTO_DELETE)
+    try:
+        await context.bot.delete_message(chat_id, msg_id)
+        os.remove(file)
+    except:
+        pass
+
+# ===== HANDLE =====
+async def handle(update, context):
     user_id = update.effective_user.id
     text = update.message.text
 
-    match = re.search(r'https?://t\.me/(?:c/)?([^/]+)/(\d+)', text)
-    if not match:
-        await update.message.reply_text("Send valid Telegram link")
+    if user_id not in ADMIN_IDS:
+        if user_id in last_used and time.time() - last_used[user_id] < COOLDOWN:
+            await update.message.reply_text("⏳ Cooldown active")
+            return
+
+    last_used[user_id] = time.time()
+
+    pos = queue.qsize() + 1
+    await update.message.reply_text(f"📌 Added to queue. Position: {pos}")
+
+    await queue.put((update, context, text))
+
+# ===== STATS =====
+async def stats(update, context):
+    if update.effective_user.id not in ADMIN_IDS:
         return
 
-    client = get_client(user_id)
-    if not client:
-        await update.message.reply_text("Login first using /login")
+    total = await users_col.count_documents({})
+    await update.message.reply_text(f"👥 Users: {total}")
+
+# ===== BROADCAST =====
+async def broadcast(update, context):
+    if update.effective_user.id not in ADMIN_IDS:
         return
 
-    chat_username = match.group(1)
-    msg_id = int(match.group(2))
+    msg = " ".join(context.args)
+    users = users_col.find()
 
-    await update.message.reply_text("Fetching...")
+    sent = 0
+    async for u in users:
+        try:
+            await context.bot.send_message(u["user_id"], msg)
+            sent += 1
+        except:
+            pass
 
-    try:
-        if not client.is_connected():
-            await client.connect()
+    await update.message.reply_text(f"Sent to {sent}")
 
-        if chat_username.isdigit():
-            entity = await client.get_entity(int(f"-100{chat_username}"))
-        else:
-            entity = await client.get_entity(chat_username)
-
-        message = await client.get_messages(entity, ids=msg_id)
-
-        if message.text:
-            await update.message.reply_text(message.text[:4000])
-        elif message.photo:
-            file = await client.download_media(message, file=bytes)
-            await update.message.reply_photo(photo=file)
-        elif message.video:
-            file = await client.download_media(message, file=bytes)
-            await update.message.reply_video(video=file)
-        elif message.document:
-            file = await client.download_media(message, file=bytes)
-            await update.message.reply_document(document=file)
-
-    except FloodWaitError as e:
-        await update.message.reply_text(f"Wait {e.seconds} seconds")
-    except Exception as e:
-        await update.message.reply_text(f"Error: {str(e)}")
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot started. Use /login")
-
+# ===== MAIN =====
 def main():
-    init_db()
-
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
@@ -186,21 +223,24 @@ def main():
             CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_code)],
             PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)]
+        fallbacks=[]
     )
 
     app.add_handler(conv)
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("logout", logout))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+
+    loop = asyncio.get_event_loop()
+    loop.create_task(worker())
 
     PORT = int(os.environ.get("PORT", 10000))
 
     app.run_webhook(
-    listen="0.0.0.0",
-    port=PORT,
-    webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
-    url_path=BOT_TOKEN,   # 🔥 THIS FIXES 404
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
+        url_path=BOT_TOKEN
     )
 
 if __name__ == "__main__":
