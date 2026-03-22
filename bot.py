@@ -15,7 +15,7 @@ from telethon.tl.types import User, Channel, Chat
 # ---------- YOUR CREDENTIALS ----------
 API_ID = 31857928
 API_HASH = "ded3b00db58fbb2b06c6b3c02ace6243"
-BOT_TOKEN = "7779675802:AAFqPxIqkmekLkZ8cbCQHU_5tXc44tfWLfQ"
+BOT_TOKEN = "6029848697:AAEEHcxrkOG0efySSSn0jWg4PDC4CgtYbOY"
 # ------------------------------------
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
