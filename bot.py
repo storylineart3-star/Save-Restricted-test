@@ -3,7 +3,6 @@ import re
 import time
 import asyncio
 import logging
-from datetime import datetime
 
 from telegram import Update
 from telegram.ext import (
@@ -24,7 +23,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 MONGO_URI = os.getenv("MONGO_URI")
 
-ADMIN_IDS = [123456789]
+ADMIN_IDS = [2067674349]
 
 COOLDOWN = 15
 AUTO_DELETE = 300
@@ -32,7 +31,7 @@ MAX_FILE_MB = 100
 
 logging.basicConfig(level=logging.INFO)
 
-# ===== MONGO =====
+# ===== DB =====
 mongo = AsyncIOMotorClient(MONGO_URI)
 db = mongo["telegram_bot"]
 users_col = db["users"]
@@ -42,6 +41,7 @@ sessions_col = db["sessions"]
 clients = {}
 last_used = {}
 queue = asyncio.Queue()
+active_tasks = {}
 
 # ===== GET CLIENT =====
 async def get_client(user_id):
@@ -58,11 +58,43 @@ async def get_client(user_id):
     clients[user_id] = client
     return client
 
+# ===== START =====
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await users_col.update_one({"user_id": update.effective_user.id}, {"$set": {}}, upsert=True)
+
+    await update.message.reply_text(
+        "👋 *Welcome to Restricted Content Saver Bot!*\n\n"
+        "🔐 Use /login to connect your Telegram account\n"
+        "📥 Send private/public message links\n\n"
+        "⚠️ OTP Format:\n"
+        "`1 2 3 4 5` (with spaces)\n\n"
+        "ℹ️ Use /help for full guide",
+        parse_mode="Markdown"
+    )
+
+# ===== HELP =====
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📘 *Full Guide*\n\n"
+        "1️⃣ /login → login your account\n"
+        "2️⃣ Send Telegram link\n\n"
+        "⚠️ Rules:\n"
+        f"- Cooldown: {COOLDOWN}s\n"
+        f"- Max size: {MAX_FILE_MB}MB\n\n"
+        "📌 Commands:\n"
+        "/start - Start bot\n"
+        "/login - Login account\n"
+        "/cancel - Cancel current task\n"
+        "/logout - Logout\n\n"
+        "👑 Admins: No limits",
+        parse_mode="Markdown"
+    )
+
 # ===== LOGIN =====
 PHONE, CODE, PASSWORD = range(3)
 
 async def login_start(update, context):
-    await update.message.reply_text("📱 Send phone number")
+    await update.message.reply_text("📱 Send phone number with country code\nExample: +919999999999")
     return PHONE
 
 async def login_phone(update, context):
@@ -74,22 +106,26 @@ async def login_phone(update, context):
     await client.send_code_request(phone)
 
     context.user_data["client"] = client
-    await update.message.reply_text("Enter OTP")
+
+    await update.message.reply_text(
+        "🔢 Enter OTP like this:\n\n`1 2 3 4 5`\n\n⚠️ Spaces required",
+        parse_mode="Markdown"
+    )
     return CODE
 
 async def login_code(update, context):
     code = update.message.text.replace(" ", "")
     client = context.user_data["client"]
-    phone = context.user_data["phone"]
     user_id = update.effective_user.id
 
     try:
-        await client.sign_in(phone, code)
+        await client.sign_in(context.user_data["phone"], code)
     except SessionPasswordNeededError:
-        await update.message.reply_text("Enter 2FA password")
+        await update.message.reply_text("🔐 Enter 2FA password")
         return PASSWORD
 
     session = client.session.save()
+
     await sessions_col.update_one(
         {"user_id": user_id},
         {"$set": {"session": session}},
@@ -97,7 +133,6 @@ async def login_code(update, context):
     )
 
     clients[user_id] = client
-    await users_col.update_one({"user_id": user_id}, {"$set": {}}, upsert=True)
 
     await update.message.reply_text("✅ Login successful!")
     return ConversationHandler.END
@@ -116,58 +151,18 @@ async def login_password(update, context):
     )
 
     clients[user_id] = client
+
     await update.message.reply_text("✅ Login successful!")
     return ConversationHandler.END
 
-# ===== QUEUE WORKER =====
-async def worker():
-    while True:
-        update, context, text = await queue.get()
-        user_id = update.effective_user.id
-
-        msg = await update.message.reply_text("⏳ Processing...")
-
-        try:
-            client = await get_client(user_id)
-
-            match = re.search(r'https?://t\.me/(?:c/)?([^/]+)/(\d+)', text)
-            chat = match.group(1)
-            msg_id = int(match.group(2))
-
-            entity = await client.get_entity(int(f"-100{chat}") if chat.isdigit() else chat)
-            message = await client.get_messages(entity, ids=msg_id)
-
-            if message.file and message.file.size > MAX_FILE_MB * 1024 * 1024:
-                await msg.edit_text("❌ File too large")
-                continue
-
-            progress_msg = await update.message.reply_text("📥 Downloading... 0%")
-
-            def progress(current, total):
-                percent = int(current * 100 / total)
-                asyncio.create_task(progress_msg.edit_text(f"📥 Downloading... {percent}%"))
-
-            file = await client.download_media(message, progress_callback=progress)
-
-            sent = await update.message.reply_document(open(file, "rb"))
-
-            asyncio.create_task(auto_delete(context, sent.chat_id, sent.message_id, file))
-
-            await msg.edit_text("✅ Done")
-
-        except Exception as e:
-            await msg.edit_text(f"Error: {str(e)}")
-
-        queue.task_done()
-
-# ===== AUTO DELETE =====
-async def auto_delete(context, chat_id, msg_id, file):
-    await asyncio.sleep(AUTO_DELETE)
-    try:
-        await context.bot.delete_message(chat_id, msg_id)
-        os.remove(file)
-    except:
-        pass
+# ===== CANCEL =====
+async def cancel(update, context):
+    user_id = update.effective_user.id
+    if user_id in active_tasks:
+        active_tasks[user_id].cancel()
+        await update.message.reply_text("❌ Task cancelled")
+    else:
+        await update.message.reply_text("No active task")
 
 # ===== HANDLE =====
 async def handle(update, context):
@@ -186,11 +181,89 @@ async def handle(update, context):
 
     await queue.put((update, context, text))
 
+# ===== WORKER =====
+async def worker(app):
+    while True:
+        update, context, text = await queue.get()
+        user_id = update.effective_user.id
+
+        task = asyncio.current_task()
+        active_tasks[user_id] = task
+
+        status = await update.message.reply_text("⏳ Processing...")
+
+        try:
+            client = await get_client(user_id)
+
+            if not client:
+                await status.edit_text("⚠️ Please /login first")
+                continue
+
+            match = re.search(r'https?://t\.me/(?:c/)?([^/]+)/(\d+)', text)
+            if not match:
+                await status.edit_text("❌ Invalid link")
+                continue
+
+            chat = match.group(1)
+            msg_id = int(match.group(2))
+
+            entity = await client.get_entity(int(f"-100{chat}") if chat.isdigit() else chat)
+            message = await client.get_messages(entity, ids=msg_id)
+
+            if message.file and message.file.size > MAX_FILE_MB * 1024 * 1024 and user_id not in ADMIN_IDS:
+                await status.edit_text("❌ File too large")
+                continue
+
+            progress_msg = await update.message.reply_text("📥 Downloading... 0%")
+
+            last_update = 0
+
+            def progress(current, total):
+                nonlocal last_update
+                now = time.time()
+                if now - last_update > 2:
+                    percent = int(current * 100 / total)
+                    asyncio.create_task(progress_msg.edit_text(f"📥 {percent}%"))
+                    last_update = now
+
+            file = await client.download_media(message, progress_callback=progress)
+
+            if message.audio:
+                sent = await update.message.reply_audio(open(file, "rb"))
+            elif message.video:
+                sent = await update.message.reply_video(open(file, "rb"))
+            elif message.photo:
+                sent = await update.message.reply_photo(open(file, "rb"))
+            else:
+                sent = await update.message.reply_document(open(file, "rb"))
+
+            asyncio.create_task(auto_delete(context, sent.chat_id, sent.message_id, file))
+
+            await status.edit_text("✅ Done")
+
+        except asyncio.CancelledError:
+            await status.edit_text("❌ Cancelled")
+        except Exception as e:
+            await status.edit_text(f"Error: {str(e)}")
+
+        finally:
+            active_tasks.pop(user_id, None)
+            queue.task_done()
+
+# ===== AUTO DELETE =====
+async def auto_delete(context, chat_id, msg_id, file):
+    await asyncio.sleep(AUTO_DELETE)
+    try:
+        await context.bot.delete_message(chat_id, msg_id)
+        if os.path.exists(file):
+            os.remove(file)
+    except:
+        pass
+
 # ===== STATS =====
 async def stats(update, context):
     if update.effective_user.id not in ADMIN_IDS:
         return
-
     total = await users_col.count_documents({})
     await update.message.reply_text(f"👥 Users: {total}")
 
@@ -214,7 +287,11 @@ async def broadcast(update, context):
 
 # ===== MAIN =====
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+
+    async def post_init(app):
+        app.create_task(worker(app))
+
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("login", login_start)],
@@ -223,16 +300,16 @@ def main():
             CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_code)],
             PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
         },
-        fallbacks=[]
+        fallbacks=[CommandHandler("cancel", cancel)]
     )
 
-    app.add_handler(conv)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
-
-    loop = asyncio.get_event_loop()
-    loop.create_task(worker())
 
     PORT = int(os.environ.get("PORT", 10000))
 
