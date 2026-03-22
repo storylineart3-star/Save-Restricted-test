@@ -197,9 +197,10 @@ def main():
     PORT = int(os.environ.get("PORT", 10000))
 
     app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
+    listen="0.0.0.0",
+    port=PORT,
+    webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
+    url_path=BOT_TOKEN,   # 🔥 THIS FIXES 404
     )
 
 if __name__ == "__main__":
