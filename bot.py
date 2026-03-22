@@ -12,7 +12,7 @@ from telegram.ext import (
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, SessionPasswordNeededError
+from telethon.errors import SessionPasswordNeededError
 
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -25,9 +25,9 @@ MONGO_URI = os.getenv("MONGO_URI")
 
 ADMIN_IDS = [2067674349]
 
-COOLDOWN = 15
+COOLDOWN = 10
 AUTO_DELETE = 300
-MAX_FILE_MB = 100
+MAX_FILE_MB = 50
 
 logging.basicConfig(level=logging.INFO)
 
@@ -63,31 +63,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await users_col.update_one({"user_id": update.effective_user.id}, {"$set": {}}, upsert=True)
 
     await update.message.reply_text(
-        "👋 *Welcome to Restricted Content Saver Bot!*\n\n"
+        "👋 Welcome!\n\n"
         "🔐 Use /login to connect your Telegram account\n"
-        "📥 Send private/public message links\n\n"
-        "⚠️ OTP Format:\n"
-        "`1 2 3 4 5` (with spaces)\n\n"
-        "ℹ️ Use /help for full guide",
-        parse_mode="Markdown"
+        "📥 Send any Telegram message link\n\n"
+        "⚠️ OTP format:\n1 2 3 4 5 (with spaces)\n\n"
+        "ℹ️ Use /help for full guide"
     )
 
 # ===== HELP =====
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📘 *Full Guide*\n\n"
-        "1️⃣ /login → login your account\n"
-        "2️⃣ Send Telegram link\n\n"
-        "⚠️ Rules:\n"
-        f"- Cooldown: {COOLDOWN}s\n"
-        f"- Max size: {MAX_FILE_MB}MB\n\n"
+        "📘 GUIDE\n\n"
+        "1. /login → connect account\n"
+        "2. Send Telegram link\n\n"
+        "⚠️ Limits:\n"
+        "- Max file: 50MB\n"
+        "- Cooldown: 10s\n\n"
         "📌 Commands:\n"
-        "/start - Start bot\n"
-        "/login - Login account\n"
-        "/cancel - Cancel current task\n"
-        "/logout - Logout\n\n"
-        "👑 Admins: No limits",
-        parse_mode="Markdown"
+        "/start /help /login /cancel\n\n"
+        "👑 Admins have no limits"
     )
 
 # ===== LOGIN =====
@@ -108,8 +102,7 @@ async def login_phone(update, context):
     context.user_data["client"] = client
 
     await update.message.reply_text(
-        "🔢 Enter OTP like this:\n\n`1 2 3 4 5`\n\n⚠️ Spaces required",
-        parse_mode="Markdown"
+        "🔢 Enter OTP like:\n1 2 3 4 5\n(Spaces required)"
     )
     return CODE
 
@@ -121,7 +114,7 @@ async def login_code(update, context):
     try:
         await client.sign_in(context.user_data["phone"], code)
     except SessionPasswordNeededError:
-        await update.message.reply_text("🔐 Enter 2FA password")
+        await update.message.reply_text("Enter 2FA password")
         return PASSWORD
 
     session = client.session.save()
@@ -133,7 +126,6 @@ async def login_code(update, context):
     )
 
     clients[user_id] = client
-
     await update.message.reply_text("✅ Login successful!")
     return ConversationHandler.END
 
@@ -151,7 +143,6 @@ async def login_password(update, context):
     )
 
     clients[user_id] = client
-
     await update.message.reply_text("✅ Login successful!")
     return ConversationHandler.END
 
@@ -169,86 +160,74 @@ async def handle(update, context):
     user_id = update.effective_user.id
     text = update.message.text
 
+    if "t.me" not in text:
+        await update.message.reply_text("❌ Send valid Telegram link")
+        return
+
     if user_id not in ADMIN_IDS:
         if user_id in last_used and time.time() - last_used[user_id] < COOLDOWN:
-            await update.message.reply_text("⏳ Cooldown active")
+            await update.message.reply_text("⏳ Wait before next request")
             return
 
     last_used[user_id] = time.time()
 
-    pos = queue.qsize() + 1
-    await update.message.reply_text(f"📌 Added to queue. Position: {pos}")
+    client = await get_client(user_id)
+    if not client:
+        await update.message.reply_text("⚠️ Please /login first")
+        return
 
-    await queue.put((update, context, text))
+    await update.message.reply_text("🔍 Fetching...")
 
-# ===== WORKER =====
-async def worker(app):
-    while True:
-        update, context, text = await queue.get()
-        user_id = update.effective_user.id
+    try:
+        match = re.search(r'https?://t\.me/(?:c/)?([^/]+)/(\d+)', text)
+        chat = match.group(1)
+        msg_id = int(match.group(2))
 
-        task = asyncio.current_task()
-        active_tasks[user_id] = task
+        entity = await client.get_entity(int(f"-100{chat}") if chat.isdigit() else chat)
+        message = await client.get_messages(entity, ids=msg_id)
 
-        status = await update.message.reply_text("⏳ Processing...")
+        # ===== TEXT ONLY =====
+        if message.text and not message.media:
+            await update.message.reply_text(message.text)
+            return
 
-        try:
-            client = await get_client(user_id)
+        # ===== FILE SIZE CHECK =====
+        if message.file:
+            size_mb = message.file.size / (1024 * 1024)
 
-            if not client:
-                await status.edit_text("⚠️ Please /login first")
-                continue
+            if size_mb > 50 and user_id not in ADMIN_IDS:
+                await update.message.reply_text("❌ File too large (Max 50MB)")
+                return
 
-            match = re.search(r'https?://t\.me/(?:c/)?([^/]+)/(\d+)', text)
-            if not match:
-                await status.edit_text("❌ Invalid link")
-                continue
+        # ===== FAST SEND =====
+        progress_msg = await update.message.reply_text("📥 Downloading...")
 
-            chat = match.group(1)
-            msg_id = int(match.group(2))
+        last_update = 0
 
-            entity = await client.get_entity(int(f"-100{chat}") if chat.isdigit() else chat)
-            message = await client.get_messages(entity, ids=msg_id)
+        def progress(current, total):
+            nonlocal last_update
+            if time.time() - last_update > 2:
+                percent = int(current * 100 / total)
+                asyncio.create_task(progress_msg.edit_text(f"📥 {percent}%"))
+                last_update = time.time()
 
-            if message.file and message.file.size > MAX_FILE_MB * 1024 * 1024 and user_id not in ADMIN_IDS:
-                await status.edit_text("❌ File too large")
-                continue
+        file = await client.download_media(message, progress_callback=progress)
 
-            progress_msg = await update.message.reply_text("📥 Downloading... 0%")
+        if message.audio:
+            sent = await update.message.reply_audio(open(file, "rb"))
+        elif message.video:
+            sent = await update.message.reply_video(open(file, "rb"))
+        elif message.photo:
+            sent = await update.message.reply_photo(open(file, "rb"))
+        else:
+            sent = await update.message.reply_document(open(file, "rb"))
 
-            last_update = 0
+        asyncio.create_task(auto_delete(context, sent.chat_id, sent.message_id, file))
 
-            def progress(current, total):
-                nonlocal last_update
-                now = time.time()
-                if now - last_update > 2:
-                    percent = int(current * 100 / total)
-                    asyncio.create_task(progress_msg.edit_text(f"📥 {percent}%"))
-                    last_update = now
+        await progress_msg.edit_text("✅ Done")
 
-            file = await client.download_media(message, progress_callback=progress)
-
-            if message.audio:
-                sent = await update.message.reply_audio(open(file, "rb"))
-            elif message.video:
-                sent = await update.message.reply_video(open(file, "rb"))
-            elif message.photo:
-                sent = await update.message.reply_photo(open(file, "rb"))
-            else:
-                sent = await update.message.reply_document(open(file, "rb"))
-
-            asyncio.create_task(auto_delete(context, sent.chat_id, sent.message_id, file))
-
-            await status.edit_text("✅ Done")
-
-        except asyncio.CancelledError:
-            await status.edit_text("❌ Cancelled")
-        except Exception as e:
-            await status.edit_text(f"Error: {str(e)}")
-
-        finally:
-            active_tasks.pop(user_id, None)
-            queue.task_done()
+    except Exception as e:
+        await update.message.reply_text(f"Error: {str(e)}")
 
 # ===== AUTO DELETE =====
 async def auto_delete(context, chat_id, msg_id, file):
@@ -260,38 +239,9 @@ async def auto_delete(context, chat_id, msg_id, file):
     except:
         pass
 
-# ===== STATS =====
-async def stats(update, context):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-    total = await users_col.count_documents({})
-    await update.message.reply_text(f"👥 Users: {total}")
-
-# ===== BROADCAST =====
-async def broadcast(update, context):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-
-    msg = " ".join(context.args)
-    users = users_col.find()
-
-    sent = 0
-    async for u in users:
-        try:
-            await context.bot.send_message(u["user_id"], msg)
-            sent += 1
-        except:
-            pass
-
-    await update.message.reply_text(f"Sent to {sent}")
-
 # ===== MAIN =====
 def main():
-
-    async def post_init(app):
-        app.create_task(worker(app))
-
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("login", login_start)],
@@ -306,8 +256,6 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
