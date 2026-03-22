@@ -1,3 +1,4 @@
 python-telegram-bot[webhooks]==20.7
 telethon==1.36.0
 motor==3.3.1
+pymongo==4.5.0
