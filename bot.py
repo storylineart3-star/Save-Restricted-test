@@ -3,7 +3,7 @@ import re
 import time
 import asyncio
 import logging
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 from telegram import Update
 from telegram.ext import (
@@ -23,10 +23,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 MONGO_URI = os.getenv("MONGO_URI")
 
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "123456789").split(",")))  # comma-separated
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "123456789").split(",")))
 COOLDOWN = 10
 AUTO_DELETE = 300
 MAX_FILE_MB = 50
+MAX_CONCURRENT_TASKS = 3  # Process up to 3 files simultaneously
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -41,14 +42,15 @@ sessions_col = db["sessions"]
 clients: Dict[int, TelegramClient] = {}
 last_used: Dict[int, float] = {}
 
-# Queue system
+# Queue system with concurrency limit
 task_queue = asyncio.Queue()
-active_tasks: Dict[int, asyncio.Task] = {}  # user_id -> task
-user_queues: Dict[int, int] = {}  # user_id -> position in queue (only for display)
+active_tasks: Dict[int, asyncio.Task] = {}
+queue_order: List[int] = []  # order of user_ids waiting
+user_queues: Dict[int, int] = {}  # user_id -> position
+semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 # ===== CLIENT MANAGEMENT =====
 async def get_client(user_id: int) -> Optional[TelegramClient]:
-    """Get or create Telethon client for a user."""
     if user_id in clients:
         return clients[user_id]
 
@@ -84,12 +86,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- Auto-delete after **5 minutes**\n\n"
         "📌 **Commands:**\n"
         "`/start` `/help` `/login` `/cancel` `/status`\n\n"
-        "👑 **Admins** have no limits and can bypass cooldown.",
+        "👑 **Admins** have no limits and bypass cooldown.",
         parse_mode="Markdown"
     )
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show user's position in the queue."""
     user_id = update.effective_user.id
     pos = user_queues.get(user_id)
     if pos is None:
@@ -164,72 +165,68 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if task and not task.done():
         task.cancel()
         await update.message.reply_text("❌ Task cancelled.")
-        # Remove from queue position tracking
-        if user_id in user_queues:
-            del user_queues[user_id]
+        # Remove from queue tracking
+        if user_id in queue_order:
+            queue_order.remove(user_id)
+        user_queues.pop(user_id, None)
+        # Recalculate positions for remaining users
+        _update_queue_positions()
     else:
         await update.message.reply_text("ℹ️ No active task to cancel.")
 
+def _update_queue_positions():
+    """Recalculate positions for all users in the queue."""
+    for idx, uid in enumerate(queue_order, start=1):
+        user_queues[uid] = idx
+
 # ===== QUEUE WORKER =====
 async def worker():
-    """Process tasks from the queue one by one."""
+    """Process tasks from the queue with concurrency limit."""
     while True:
         task_info = await task_queue.get()
         user_id = task_info["user_id"]
-        update = task_info["update"]
+        update_obj = task_info["update"]
         context = task_info["context"]
         client = task_info["client"]
         message = task_info["message"]
         link = task_info["link"]
 
-        # Create the task and store it
-        async def process():
+        # Acquire semaphore to limit concurrency
+        async with semaphore:
+            # Create the processing coroutine
+            async def process():
+                try:
+                    await process_message(user_id, update_obj, context, client, message, link)
+                except asyncio.CancelledError:
+                    await update_obj.message.reply_text("❌ Task cancelled.")
+                except Exception as e:
+                    logger.exception("Error processing task for user %s", user_id)
+                    await update_obj.message.reply_text(f"❌ Error: {str(e)}")
+                finally:
+                    # Clean up
+                    active_tasks.pop(user_id, None)
+                    if user_id in queue_order:
+                        queue_order.remove(user_id)
+                    _update_queue_positions()
+
+            task = asyncio.create_task(process())
+            active_tasks[user_id] = task
             try:
-                await process_message(user_id, update, context, client, message, link)
+                await task
             except asyncio.CancelledError:
-                await update.message.reply_text("❌ Task cancelled.")
-                raise
-            except Exception as e:
-                logger.exception("Error processing task for user %s", user_id)
-                await update.message.reply_text(f"❌ Error: {str(e)}")
+                pass
             finally:
-                # Clean up
-                active_tasks.pop(user_id, None)
-                if user_id in user_queues:
-                    del user_queues[user_id]
-                # Update positions for remaining queued users
-                update_queue_positions()
+                task_queue.task_done()
 
-        task = asyncio.create_task(process())
-        active_tasks[user_id] = task
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        finally:
-            task_queue.task_done()
-
-def update_queue_positions():
-    """Update the queue positions for all users in the queue."""
-    # This is a simplified update: we can store positions in a dict when enqueuing
-    # But since we have a FIFO queue, we can just iterate over its internal list (not exposed)
-    # Alternative: store positions when adding and maintain a deque of user_ids.
-    # For simplicity, we'll recalc positions each time by reading the queue's internal _queue
-    # but that's not public. We'll instead keep a list of user_ids separately.
-    # Let's modify enqueue to store a list of user_ids in order.
-    pass
-
-# To track queue order
-queue_order = []
-
-async def enqueue_task(user_id, update, context, client, message, link):
+async def enqueue_task(user_id: int, update_obj: Update, context: ContextTypes.DEFAULT_TYPE,
+                       client: TelegramClient, message: Update.message, link: str) -> int:
     """Add a task to the queue and return the position."""
-    pos = len(queue_order) + 1
     queue_order.append(user_id)
+    pos = len(queue_order)
     user_queues[user_id] = pos
     await task_queue.put({
         "user_id": user_id,
-        "update": update,
+        "update": update_obj,
         "context": context,
         "client": client,
         "message": message,
@@ -237,9 +234,10 @@ async def enqueue_task(user_id, update, context, client, message, link):
     })
     return pos
 
-async def process_message(user_id, update, context, client, message, link):
+async def process_message(user_id: int, update_obj: Update, context: ContextTypes.DEFAULT_TYPE,
+                          client: TelegramClient, message: Update.message, link: str):
     """Actual download and send logic."""
-    progress_msg = await update.message.reply_text("🔍 Fetching message...")
+    progress_msg = await update_obj.message.reply_text("🔍 Fetching message...")
     try:
         # Parse link
         match = re.search(r'https?://t\.me/(?:c/)?([^/]+)/(\d+)', link)
@@ -263,7 +261,7 @@ async def process_message(user_id, update, context, client, message, link):
         # Text-only message
         if msg.text and not msg.media:
             await progress_msg.delete()
-            await update.message.reply_text(msg.text)
+            await update_obj.message.reply_text(msg.text)
             return
 
         # File size check (for non-admins)
@@ -282,6 +280,7 @@ async def process_message(user_id, update, context, client, message, link):
             now = time.time()
             if now - last_update >= 2 and total > 0:
                 percent = int(current * 100 / total)
+                # Schedule the edit in the event loop (safe from threads)
                 asyncio.create_task(progress_msg.edit_text(f"📥 Downloading... {percent}%"))
                 last_update = now
 
@@ -291,19 +290,19 @@ async def process_message(user_id, update, context, client, message, link):
         await progress_msg.edit_text("📤 Uploading...")
         with open(file_path, "rb") as f:
             if msg.audio:
-                sent = await update.message.reply_audio(f, caption=msg.text if msg.text else None)
+                sent = await update_obj.message.reply_audio(f, caption=msg.text if msg.text else None)
             elif msg.video:
-                sent = await update.message.reply_video(f, caption=msg.text if msg.text else None)
+                sent = await update_obj.message.reply_video(f, caption=msg.text if msg.text else None)
             elif msg.photo:
-                sent = await update.message.reply_photo(f, caption=msg.text if msg.text else None)
+                sent = await update_obj.message.reply_photo(f, caption=msg.text if msg.text else None)
             else:
-                sent = await update.message.reply_document(f, caption=msg.text if msg.text else None)
+                sent = await update_obj.message.reply_document(f, caption=msg.text if msg.text else None)
 
         # Schedule auto-delete of the sent message and local file
         asyncio.create_task(auto_delete(context, sent.chat_id, sent.message_id, file_path))
 
         await progress_msg.delete()
-        await update.message.reply_text("✅ Done!")
+        await update_obj.message.reply_text("✅ Done!")
 
     except Exception as e:
         logger.exception("Error processing message for user %s", user_id)
@@ -386,6 +385,7 @@ def main():
 
     PORT = int(os.environ.get("PORT", 10000))
 
+    # Use webhook
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
